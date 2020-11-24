@@ -40,9 +40,46 @@ function S3Path()
     )
 end
 
+function S3Path(
+    bucket::AbstractString,
+    key::AbstractString;
+    isdirectory::Bool=false,
+    config::AWSConfig=aws_config(),
+)
+    return S3Path(
+        Tuple(filter!(!isempty, split(key, "/"))),
+        "/",
+        strip(startswith(bucket, "s3://") ? bucket : "s3://$bucket", '/'),
+        isdirectory,
+        config,
+    )
+end
+
+function S3Path(
+    bucket::AbstractString,
+    key::AbstractPath;
+    isdirectory::Bool=false,
+    config::AWSConfig=aws_config(),
+)
+    return S3Path(
+        key.segments,
+        "/",
+        normalize_bucket_name(bucket),
+        isdirectory,
+        config,
+    )
+end
+
+# To avoid a breaking change.
 function S3Path(str::AbstractString; config::AWSConfig=aws_config())
+    result = tryparse(S3Path, str; config=config)
+    result !== nothing || throw(ArgumentError("Invalid s3 path string: $str"))
+    return result
+end
+
+function Base.tryparse(::Type{S3Path}, str::AbstractString; config::AWSConfig=aws_config())
     str = String(str)
-    startswith(str, "s3://") || throw(ArgumentError("$str doesn't start with s://"))
+    startswith(str, "s3://") || return nothing
     root = ""
     path = ()
     isdirectory = true
@@ -59,6 +96,10 @@ function S3Path(str::AbstractString; config::AWSConfig=aws_config())
     end
 
     return S3Path(path, root, drive, isdirectory, config)
+end
+
+function normalize_bucket_name(bucket)
+    return strip(startswith(bucket, "s3://") ? bucket : "s3://$bucket", '/')
 end
 
 Base.print(io::IO, fp::S3Path) = print(io, fp.anchor * fp.key)
@@ -78,6 +119,10 @@ function Base.getproperty(fp::S3Path, attr::Symbol)
     elseif attr === :bucket
         return split(fp.drive, "//")[2]
     elseif attr === :key
+        if isempty(fp.segments)
+            return ""
+        end
+
         return join(fp.segments, '/') * (fp.isdirectory ? "/" : "")
     else
         return getfield(fp, attr)
@@ -86,7 +131,7 @@ end
 
 # We need to special case join and parents so that we propagate
 # directories correctly (see type docstring for details)
-function Base.join(prefix::S3Path, pieces::AbstractString...)
+function FilePathsBase.join(prefix::S3Path, pieces::AbstractString...)
     isempty(pieces) && return prefix
 
     segments = String[prefix.segments...]
@@ -98,7 +143,7 @@ function Base.join(prefix::S3Path, pieces::AbstractString...)
 
     return S3Path(
         tuple(segments...),
-        prefix.root,
+        "/",
         prefix.drive,
         isdirectory,
         prefix.config,
@@ -107,7 +152,7 @@ end
 
 function FilePathsBase.parents(fp::S3Path)
     if hasparent(fp)
-        return map(1:length(fp.segments)-1) do i
+        return map(0:length(fp.segments)-1) do i
             S3Path(fp.segments[1:i], fp.root, fp.drive, true, fp.config)
         end
     elseif fp.segments == tuple(".") || isempty(fp.segments)
@@ -117,7 +162,6 @@ function FilePathsBase.parents(fp::S3Path)
     end
 end
 
-FilePathsBase.ispathtype(::Type{S3Path}, str::AbstractString) = startswith(str, "s3://")
 FilePathsBase.exists(fp::S3Path) = s3_exists(fp.config, fp.bucket, fp.key)
 Base.isfile(fp::S3Path) = !fp.isdirectory && exists(fp)
 function Base.isdir(fp::S3Path)
@@ -130,7 +174,12 @@ function Base.isdir(fp::S3Path)
     end
 
     objects = s3_list_objects(fp.config, fp.bucket, key; max_items=1)
-    return !isempty(objects)
+
+    # `objects` is a `Channel`, so we call iterate to see if there are any objects that
+    # match our directory key.
+    # NOTE: `iterate` should handle waiting on a value to become available or return `nothing`
+    # if the channel is closed without inserting anything.
+    return iterate(objects) !== nothing
 end
 
 function Base.stat(fp::S3Path)

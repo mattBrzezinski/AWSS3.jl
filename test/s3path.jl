@@ -1,4 +1,7 @@
+bucket_name = "ocaws.jl.test." * lowercase(Dates.format(now(Dates.UTC), "yyyymmddTHHMMSSZ"))
+s3_create_bucket(bucket_name)
 root = Path("s3://$bucket_name/pathset-root/")
+
 ps = PathSet(
     root,
     root / "foo/",
@@ -11,6 +14,31 @@ ps = PathSet(
     false
 )
 
+function test_s3_constructors(ps::PathSet)
+    @test S3Path(bucket_name, "pathset-root/foo/baz.txt") == ps.baz
+    @test S3Path(bucket_name, p"pathset-root/foo/baz.txt") == ps.baz
+    @test S3Path(bucket_name, p"/pathset-root/foo/baz.txt") == ps.baz
+    @test S3Path("s3://$bucket_name", p"/pathset-root/foo/baz.txt") == ps.baz
+    @test S3Path(bucket_name, "pathset-root/bar/qux"; isdirectory=true) == ps.qux
+    @test S3Path(bucket_name, "pathset-root/bar/qux/"; isdirectory=true) == ps.qux
+    @test S3Path(bucket_name, p"pathset-root/bar/qux"; isdirectory=true) == ps.qux
+    @test S3Path(bucket_name, p"/pathset-root/bar/qux"; isdirectory=true) == ps.qux
+end
+
+function test_s3_parents(ps::PathSet)
+    @testset "parents" begin
+        @test parent(ps.foo) == ps.root
+        @test parent(ps.qux) == ps.bar
+        @test dirname(ps.foo) == ps.root
+
+        @test hasparent(ps.qux)
+        _parents = parents(ps.qux)
+        @test _parents[end] == ps.bar
+        @test _parents[end - 1] == ps.root
+        @test _parents[1] == Path(ps.root; segments=())
+    end
+end
+
 function test_s3_join(ps::PathSet)
     @testset "join" begin
         @test join(ps.root, "bar/") == ps.bar
@@ -19,12 +47,12 @@ function test_s3_join(ps::PathSet)
     end
 end
 
-function test_s3_norm(ps::PathSet)
+function test_s3_normalize(ps::PathSet)
     @testset "norm" begin
-        @test norm(ps.bar / ".." / "foo/") == ps.foo
-        @test norm(ps.bar / ".." / "foo") != ps.foo
-        @test norm(ps.bar / "./") == ps.bar
-        @test norm(ps.bar / "../") == ps.root
+        @test normalize(ps.bar / ".." / "foo/") == ps.foo
+        @test normalize(ps.bar / ".." / "foo") != ps.foo
+        @test normalize(ps.bar / "./") == ps.bar
+        @test normalize(ps.bar / "../") == ps.root
     end
 end
 
@@ -145,26 +173,30 @@ end
 
 @testset "$(typeof(ps.root))" begin
     testsets = [
-        test_constructor,
+        test_s3_constructors,
         test_registration,
         test_show,
         test_parse,
         test_convert,
         test_components,
-        test_parents,
+        test_indexing,
+        test_iteration,
+        test_s3_parents,
+        test_descendants_and_ascendants,
         test_s3_join,
+        test_splitext,
         test_basename,
         test_filename,
         test_extensions,
         test_isempty,
-        test_s3_norm,
-        # test_real, # real doesn't make sense for S3Paths
+        test_s3_normalize,
+        # test_canonicalize, # real doesn't make sense for S3Paths
         test_relative,
-        test_abs,
+        test_absolute,
         test_isdir,
         test_isfile,
         test_stat,
-        test_size,
+        test_filesize,
         test_modified,
         test_created,
         test_cd,
@@ -202,4 +234,83 @@ end
 
     # Run all of the automated tests
     test(ps, testsets)
+end
+
+@testset "readdir" begin
+    function initialize()
+        """
+        Hierarchy:
+
+        bucket-name
+        |-- test_01.txt
+        |-- emptydir/
+        |-- subdir1/
+        |   |-- test_02.txt
+        |   |-- test_03.txt
+        |   |-- subdir2/
+        |       |-- test_04.txt
+        |       |-- subdir3/
+        """
+        s3_put(bucket_name, "test_01.txt", "test01")
+        s3_put(bucket_name, "emptydir/", "")
+        s3_put(bucket_name, "subdir1/", "")
+        s3_put(bucket_name, "subdir1/test_02.txt", "test02")
+        s3_put(bucket_name, "subdir1/test_03.txt", "test03")
+        s3_put(bucket_name, "subdir1/subdir2/", "")
+        s3_put(bucket_name, "subdir1/subdir2/test_04.txt", "test04")
+        s3_put(bucket_name, "subdir1/subdir2/subdir3/", "")
+    end
+
+    function verify_files(path::S3Path)
+        @test readdir(path) == ["emptydir/", "subdir1/", "test_01.txt"]
+        @test readdir(path / "emptydir/") == []
+        @test readdir(path / "subdir1/") == ["subdir2/", "test_02.txt", "test_03.txt"]
+        @test readdir(path / "subdir1/subdir2/") == ["subdir3/", "test_04.txt"]
+        @test readdir(path / "subdir1/subdir2/subdir3/") == []
+    end
+
+    function verify_files(path::AbstractPath)
+        @test readdir(path) == ["emptydir", "subdir1", "test_01.txt"]
+        @test readdir(path / "emptydir/") == []
+        @test readdir(path / "subdir1/") == ["subdir2", "test_02.txt", "test_03.txt"]
+        @test readdir(path / "subdir1/subdir2/") == ["subdir3", "test_04.txt"]
+        @test readdir(path / "subdir1/subdir2/subdir3/") == []
+    end
+
+    initialize()
+
+    @testset "S3" begin
+        verify_files(S3Path("s3://$bucket_name/"))
+        @test_throws ArgumentError("Invalid s3 path string: $bucket_name") S3Path(bucket_name)
+    end
+
+    @test_skip @testset "Local" begin
+        temp_path = Path(tempdir() * string(uuid4()))
+        mkdir(temp_path)
+
+        sync(S3Path("s3://$bucket_name/"), temp_path)
+        verify_files(temp_path)
+
+        rm(temp_path, force=true, recursive=true)
+    end
+
+    @testset "join" begin
+        @test (  # test trailing slash on prefix does not matter for join
+            p"s3://foo/bar" / "baz" ==
+            p"s3://foo/bar/" / "baz" ==
+            p"s3://foo/bar/baz"
+        )
+        @test (  # test trailing slash on root-only prefix in particular does not matter
+            p"s3://foo" / "bar" / "baz" ==
+            p"s3://foo/" / "bar" / "baz" ==
+            p"s3://foo/bar/baz"
+        )
+        # test extra leading and trailing slashes do not matter
+        @test p"s3://foo/" / "bar/" / "/baz" == p"s3://foo/bar/baz"
+        # test joining `/` and string concatentation `*` play nice as expected
+        @test p"s3://foo" * "/" / "bar" == p"s3://foo" / "/" * "bar" == p"s3://foo" / "bar"
+        @test p"s3://foo" / "bar" * "baz" == p"s3://foo/bar" * "baz"  == p"s3://foo" / "barbaz"
+        # test trailing slash on final piece is included
+        @test p"s3://foo/bar" / "baz/" == p"s3://foo/bar/baz/"
+    end
 end
